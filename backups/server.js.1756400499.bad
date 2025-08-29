@@ -1,0 +1,165 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import OpenAI from 'openai';
+
+// ---------- Setup ----------
+const app = express();
+app.use(cors()); // TODO: restrict to your WP origin later
+app.use(express.json({ limit: '1mb' }));
+
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
+// ---------- Optional Zoho (safe no-op if not configured) ----------
+const ZOHO_ACCOUNTS = process.env.ZOHO_ACCOUNTS_DOMAIN || 'https://accounts.zoho.eu';
+const ZOHO_API = process.env.ZOHO_API_DOMAIN || 'https://www.zohoapis.eu';
+const hasZoho = Boolean(process.env.ZOHO_CLIENT_ID && process.env.ZOHO_CLIENT_SECRET && process.env.ZOHO_REFRESH_TOKEN);
+
+async function getZohoAccessToken() {
+  const r = await fetch(`${ZOHO_ACCOUNTS}/oauth/v2/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: process.env.ZOHO_REFRESH_TOKEN || '',
+      client_id: process.env.ZOHO_CLIENT_ID || '',
+      client_secret: process.env.ZOHO_CLIENT_SECRET || ''
+    })
+  });
+  if (!r.ok) throw new Error(`Zoho token ${r.status}: ${await r.text()}`);
+  const j = await r.json();
+  return j.access_token;
+}
+
+async function createZohoLead(payload) {
+  if (!hasZoho) return { status: 'noop', message: 'Zoho not configured' };
+  const token = await getZohoAccessToken();
+  const r = await fetch(`${ZOHO_API}/crm/v8/Leads`, {
+    method: 'POST',
+    headers: { Authorization: `Zoho-oauthtoken ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: [payload] })
+  });
+  if (!r.ok) throw new Error(`Zoho create lead ${r.status}: ${await r.text()}`);
+  return await r.json();
+}
+
+// ---------- Tool definition (Chat Completions format) ----------
+const tools = [
+  {
+    type: 'function',
+    function: {
+      name: 'create_lead',
+      description: 'Create a Zoho CRM Lead from user-provided details.',
+      parameters: {
+        type: 'object',
+        properties: {
+          Last_Name:   { type: 'string', description: 'Surname of the person' },
+          Company:     { type: 'string' },
+          Email:       { type: 'string', format: 'email' },
+          Phone:       { type: 'string' },
+          Description: { type: 'string' }
+        },
+        required: ['Last_Name', 'Email']
+      }
+    }
+  }
+];
+
+// ---------- Routes ----------
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.post('/chat', async (req, res) => {
+  try {
+    const incoming = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const messages = incoming
+      .filter(m => m && typeof m.content === 'string' && typeof m.role === 'string')
+      .map(m => ({ role: m.role, content: m.content }));
+
+    if (messages.length === 0) {
+      return res.status(400).json({ error: "Provide messages: [{role:'user', content:'...'}]" });
+    }
+
+    const systemMsg = {
+      role: 'system',
+      content:
+        "You are the Content Creatures website assistant. Be concise, friendly and helpful. " +
+        "If the user shares contact details or asks to be contacted, you may call the tool 'create_lead' with their details. " +
+        "If you don't know something, say so."
+    };
+
+    const convo = [systemMsg, ...messages];
+
+    // ---- First call (allow tool use) ----
+    const first = await client.chat.completions.create({
+      model: MODEL,
+      messages: convo,
+      tools,
+      tool_choice: 'auto'
+      // no temperature (your model only supports default)
+    });
+
+    const reply = first.choices?.[0]?.message || { role: 'assistant', content: '' };
+
+    // No tool calls -> return the assistant text
+    if (!reply.tool_calls || reply.tool_calls.length === 0) {
+      return res.json({ text: reply.content || '' });
+    }
+
+    // ---- Execute tool calls ----
+    const toolResults = [];
+    for (const tc of reply.tool_calls) {
+      if (tc.type !== 'function') continue;
+      const name = tc.function?.name;
+      let args = {};
+      try { args = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+      let out;
+
+      if (name === 'create_lead') {
+        try {
+          out = await createZohoLead({
+            Last_Name: args.Last_Name,
+            Company: args.Company ?? 'Unknown',
+            Email: args.Email,
+            Phone: args.Phone,
+            Description: args.Description ?? 'Created via website chatbot'
+          });
+        } catch (e) {
+          out = { status: 'error', message: String(e?.message || e) };
+        }
+      } else {
+        out = { status: 'error', message: `Unknown function: ${name}` };
+      }
+
+      toolResults.push({
+        role: 'tool',
+        tool_call_id: tc.id,
+        content: JSON.stringify(out)
+      });
+    }
+
+    // ---- Second call (model sees tool outputs) ----
+    const secondMessages = [...convo, reply, ...toolResults];
+    const second = await client.chat.completions.create({
+      model: MODEL,
+      messages: secondMessages
+    });
+
+    const finalText = second.choices?.[0]?.message?.content ?? '';
+    return res.json({ text: finalText });
+  } catch (e) {
+    console.error(e?.stack || e);
+    const msg = e?.message || 'Server error';
+    const status =
+      /api key|unauthorized|401/i.test(msg) ? 401 :
+      /bad request|unknown parameter|missing required parameter|400/i.test(msg) ? 400 :
+      500;
+    return res.status(status).json({ error: msg });
+  }
+});
+
+// ---------- Start ----------
+const PORT = Number(process.env.PORT || 8080);
+app.listen(PORT, '127.0.0.1', () => {
+  console.log(`CC bot listening on http://127.0.0.1:${PORT}`);
+});

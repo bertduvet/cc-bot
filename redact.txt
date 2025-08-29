@@ -1,0 +1,2 @@
+regex:(sk-[A-Za-z0-9_\-]{10,})==>OPENAI_KEY_REDACTED
+regex:(vs_[A-Za-z0-9]{6,})==>VECTOR_STORE_ID_REDACTED

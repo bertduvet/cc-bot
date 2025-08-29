@@ -1,0 +1,121 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import OpenAI from 'openai';
+
+const app = express();
+app.use(cors());           // tighten to your WP origin later
+app.use(express.json());
+
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const tools = [{
+  type: 'function',
+  function: {
+    name: 'create_lead',
+    description: 'Create a Zoho CRM Lead from user-provided details',
+    parameters: {
+      type: 'object',
+      properties: {
+        Last_Name: { type: 'string' },
+        Company: { type: 'string' },
+        Email: { type: 'string', format: 'email' },
+        Phone: { type: 'string' },
+        Description: { type: 'string' }
+      },
+      required: ['Last_Name', 'Email']
+    }
+  }
+}];
+
+const hasZoho = Boolean(process.env.ZOHO_CLIENT_ID && process.env.ZOHO_CLIENT_SECRET && process.env.ZOHO_REFRESH_TOKEN);
+
+async function getZohoAccessToken() {
+  const resp = await fetch(`${process.env.ZOHO_ACCOUNTS_DOMAIN}/oauth/v2/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: process.env.ZOHO_REFRESH_TOKEN ?? '',
+      client_id: process.env.ZOHO_CLIENT_ID ?? '',
+      client_secret: process.env.ZOHO_CLIENT_SECRET ?? ''
+    })
+  });
+  if (!resp.ok) throw new Error(`Zoho token ${resp.status}`);
+  return (await resp.json()).access_token;
+}
+
+async function createZohoLead(payload) {
+  if (!hasZoho) return { status: 'noop', message: 'Zoho not configured yet' };
+  const token = await getZohoAccessToken();
+  const res = await fetch(`${process.env.ZOHO_API_DOMAIN}/crm/v8/Leads`, {
+    method: 'POST',
+    headers: { Authorization: `Zoho-oauthtoken ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: [payload] })
+  });
+  if (!res.ok) throw new Error(`Zoho create lead ${res.status}: ${await res.text()}`);
+  return await res.json();
+}
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.post('/chat', async (req, res) => {
+  try {
+    const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const file_search = process.env.OPENAI_VECTOR_STORE_ID
+      ? { vector_store_ids: [process.env.OPENAI_VECTOR_STORE_ID] }
+      : undefined;
+
+    const inputList = [...messages];
+    const first = await client.responses.create({
+      model: process.env.OPENAI_MODEL,
+      input: inputList,
+      tools,
+      tool_choice: 'auto',
+      file_search
+    });
+
+    const calls = (first.output ?? []).filter(o => o.type === 'function_call');
+
+    if (calls.length) {
+      for (const call of calls) {
+        if (call.name !== 'create_lead') continue;
+        let args = {};
+        try { args = JSON.parse(call.arguments || '{}'); } catch {}
+        let out;
+        try {
+          out = await createZohoLead({
+            Last_Name: args.Last_Name,
+            Company: args.Company ?? 'Unknown',
+            Email: args.Email,
+            Phone: args.Phone,
+            Description: args.Description ?? 'Created via website chatbot'
+          });
+        } catch (e) {
+          out = { status: 'error', message: String(e.message || e) };
+        }
+        inputList.push({
+          type: 'function_call_output',
+          call_id: call.call_id,
+          output: JSON.stringify(out)
+        });
+      }
+      const second = await client.responses.create({
+        model: process.env.OPENAI_MODEL,
+        input: inputList,
+        tools,
+        file_search
+      });
+      return res.json({ text: second.output_text });
+    }
+
+    return res.json({ text: first.output_text });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || 'Server error' });
+  }
+});
+
+app.listen(Number(process.env.PORT || 8080), '127.0.0.1', () => {
+  console.log(`CC bot listening on :${process.env.PORT || 8080}`);
+});
